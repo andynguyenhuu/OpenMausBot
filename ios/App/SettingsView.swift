@@ -144,6 +144,16 @@ struct SettingsView: View {
                                 SettingsIcon(symbol: "link", color: .blue)
                             }
                         }
+
+                        NavigationLink {
+                            McpConnectionsView()
+                        } label: {
+                            Label {
+                                Text("MCP Connections")
+                            } icon: {
+                                SettingsIcon(symbol: "server.rack", color: .indigo)
+                            }
+                        }
                     }
                 }
             }

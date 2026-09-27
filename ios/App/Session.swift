@@ -2274,6 +2274,39 @@ final class Session: ObservableObject {
         catch { actionError = error.localizedDescription; return nil }
     }
 
+    // MARK: - MCP OAuth connections
+
+    func loadMcpOAuthConnections() async -> [McpOAuthConnectionSummary]? {
+        guard let client else { return nil }
+        do { return try await client.mcpOAuthConnections() }
+        catch { actionError = error.localizedDescription; return nil }
+    }
+
+    func startMcpOAuthConnection(
+        serverUrl: String,
+        serverName: String?,
+        connectionId: String?
+    ) async -> URL? {
+        guard let client else { return nil }
+        do {
+            let result = try await client.startMcpOAuthConnection(
+                serverUrl: serverUrl,
+                serverName: serverName,
+                connectionId: connectionId
+            )
+            return URL(string: result.authorizationUrl)
+        } catch {
+            actionError = error.localizedDescription
+            return nil
+        }
+    }
+
+    func disconnectMcpOAuthConnection(_ connectionId: String) async {
+        guard let client else { return }
+        do { try await client.disconnectMcpOAuthConnection(connectionId) }
+        catch { actionError = error.localizedDescription }
+    }
+
     func refreshNotificationAuthorization() async {
         notificationAuthorization = await NotificationCoordinator.shared.authorizationStatus()
         notificationAuthorizationResolved = true

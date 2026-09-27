@@ -556,6 +556,36 @@ public enum SharedMessageComposer {
     }
 }
 
+/// One remote MCP server's OAuth state, as the server tells it —
+/// `McpOAuthConnectionSummary` in server/mcp-oauth-store.ts with the secret
+/// fields (client secret, access/refresh tokens) already stripped.
+public struct McpOAuthConnectionSummary: Decodable, Identifiable, Sendable {
+    public var connectionId: String
+    public var serverName: String?
+    public var serverUrl: String
+    public var status: String
+    public var error: String?
+    public var ownerLabel: String?
+    public var createdAt: String
+    public var updatedAt: String
+
+    public var id: String { connectionId }
+
+    /// True once a connection needs the person to go through the browser
+    /// again — first time, or after `status` fell to "expired"/"error".
+    public var needsReconnect: Bool { status != "connected" && status != "pending" }
+}
+
+private struct McpOAuthConnectionsResponse: Decodable, Sendable {
+    let connections: [McpOAuthConnectionSummary]
+}
+
+public struct McpOAuthStartResult: Decodable, Sendable {
+    public var connectionId: String
+    public var authorizationUrl: String
+    public var expiresAt: String
+}
+
 private struct FileUploadResponse: Decodable {
     let path: String
     let name: String
@@ -1597,6 +1627,44 @@ public struct CompanionClient: Sendable {
               url.host != nil
         else { throw APIError.badURL }
         return url
+    }
+
+    // MARK: - MCP OAuth connections
+
+    /// Every remote MCP server this install has started an OAuth handshake
+    /// for, in whatever state it's in (pending, connected, expired, error).
+    /// Tokens never ride in this response — the server strips them before
+    /// answering (`summarizeConnection` in server/mcp-oauth-store.ts).
+    public func mcpOAuthConnections() async throws -> [McpOAuthConnectionSummary] {
+        try await send(try makeRequest("GET", "/api/mcp-oauth/connections"), as: McpOAuthConnectionsResponse.self).connections
+    }
+
+    /// Start (or restart) an OAuth handshake for a remote MCP server. Pass
+    /// the existing `connectionId` back to reconnect the same record rather
+    /// than creating a second one for the same server. The caller opens the
+    /// returned `authorizationUrl` in the system browser; there is nothing
+    /// more to do here until the callback lands on the computer.
+    public func startMcpOAuthConnection(
+        serverUrl: String,
+        serverName: String? = nil,
+        connectionId: String? = nil
+    ) async throws -> McpOAuthStartResult {
+        var body: [String: Any] = ["serverUrl": serverUrl]
+        if let serverName { body["serverName"] = serverName }
+        if let connectionId { body["connectionId"] = connectionId }
+        let result = try await send(
+            try makeRequest("POST", "/api/mcp-oauth/connections", body: body),
+            as: McpOAuthStartResult.self
+        )
+        guard let url = URL(string: result.authorizationUrl), url.scheme == "https", url.host != nil else {
+            throw APIError.badURL
+        }
+        return result
+    }
+
+    public func disconnectMcpOAuthConnection(_ connectionId: String) async throws {
+        guard Self.validRouteID(connectionId) else { throw APIError.badURL }
+        try await send(try makeRequest("DELETE", "/api/mcp-oauth/connections/\(connectionId)"))
     }
 
     /// Matches the companion's `[\w-]+` toolkit route component. JavaScript
