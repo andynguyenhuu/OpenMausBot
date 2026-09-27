@@ -1426,6 +1426,37 @@ describe("customMcpServers with url entries", () => {
       notes: { command: "npx", args: [], env: {} },
     });
   });
+
+  it("carries oauthConnectionId through unchanged (regression: existing static-header servers are untouched)", () => {
+    const cfg = {
+      mcpServers: {
+        clickup: { url: "https://mcp.clickup.com/mcp", oauthConnectionId: "conn-1" },
+        docs: { type: "http", url: "https://docs.example/mcp", headers: { Authorization: "Bearer real" } },
+      },
+    } as Parameters<typeof customMcpServers>[0];
+    expect(customMcpServers(cfg)).toEqual({
+      clickup: { type: "http", url: "https://mcp.clickup.com/mcp", headers: {}, oauthConnectionId: "conn-1" },
+      docs: { type: "http", url: "https://docs.example/mcp", headers: { Authorization: "Bearer real" } },
+    });
+  });
+
+  it("scoping: a bot's own mcpServers list excludes an OAuth-backed server it was not given, before any token could be resolved", () => {
+    const cfg = {
+      mcpServers: {
+        clickup: { url: "https://mcp.clickup.com/mcp", oauthConnectionId: "conn-1" },
+        notes: { command: "npx" },
+      },
+    } as Parameters<typeof customMcpServers>[0];
+    // the allowlisted bot gets it (server/index.ts's engineMcpServers then
+    // resolves conn-1's live Authorization header for exactly this entry)
+    expect(customMcpServers(cfg, ["clickup"])).toEqual({
+      clickup: { type: "http", url: "https://mcp.clickup.com/mcp", headers: {}, oauthConnectionId: "conn-1" },
+    });
+    // a bot scoped to a different server never sees the OAuth-backed one at
+    // all — there is no oauthConnectionId for engineMcpServers to resolve a
+    // token for, so it can never receive that server's Authorization header
+    expect(customMcpServers(cfg, ["notes"])).toEqual({ notes: { command: "npx", args: [], env: {} } });
+  });
 });
 
 describe("loadConfig with an unusable config.json", () => {

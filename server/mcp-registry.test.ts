@@ -172,4 +172,40 @@ describe("remote (url) MCP servers", () => {
       { command: "old", args: [], env: { Authorization: "x" }, enabled: true },
     )).toEqual({ ok: false, error: "No saved value exists for Authorization." });
   });
+
+  it("accepts an OAuth-backed remote entry and carries the connection id through", () => {
+    expect(parseStoredMcpServer("clickup", { url: "https://mcp.clickup.com/mcp", oauthConnectionId: "conn-abc123" })).toEqual({
+      ok: true,
+      server: { type: "http", url: "https://mcp.clickup.com/mcp", headers: {}, enabled: true, oauthConnectionId: "conn-abc123" },
+    });
+    const listings = listMcpServers({ clickup: { url: "https://mcp.clickup.com/mcp", oauthConnectionId: "conn-abc123" } });
+    expect(listings).toEqual([{
+      name: "clickup", type: "http", url: "https://mcp.clickup.com/mcp", headerKeys: [], enabled: true, oauthConnectionId: "conn-abc123",
+    }]);
+  });
+
+  it("refuses an OAuth-backed entry that also carries a stored Authorization header", () => {
+    expect(parseStoredMcpServer("clickup", {
+      url: "https://mcp.clickup.com/mcp",
+      oauthConnectionId: "conn-abc123",
+      headers: { Authorization: "Bearer x" },
+    })).toEqual({ ok: false, error: "Remove the Authorization header — it is set by the OAuth connection." });
+    // case-insensitive header name match
+    expect(parseStoredMcpServer("clickup", {
+      url: "https://mcp.clickup.com/mcp",
+      oauthConnectionId: "conn-abc123",
+      headers: { authorization: "Bearer x" },
+    })).toEqual({ ok: false, error: "Remove the Authorization header — it is set by the OAuth connection." });
+  });
+
+  it("refuses a malformed oauthConnectionId", () => {
+    expect(parseStoredMcpServer("clickup", { url: "https://mcp.clickup.com/mcp", oauthConnectionId: "has a space" })).toMatchObject({ ok: false });
+  });
+
+  it("a plain static-header remote server is unaffected by the OAuth field (regression)", () => {
+    expect(parseStoredMcpServer("docs", { url: "https://docs.example/mcp", headers: { Authorization: "Bearer real" } })).toEqual({
+      ok: true,
+      server: { type: "http", url: "https://docs.example/mcp", headers: { Authorization: "Bearer real" }, enabled: true },
+    });
+  });
 });

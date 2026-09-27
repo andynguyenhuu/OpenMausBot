@@ -1349,7 +1349,13 @@ export function instanceConfigs(cfg: AppConfig): InstanceConfigMap {
 // Validate-with-skip so one bad entry never takes the fleet down, and each
 // skip is logged once with a sentence that teaches.
 
-export type CustomMcpServer = McpServerSpec;
+// A remote server backed by an OAuth connection (server/mcp-oauth.ts) carries
+// its connection id through this stage so server/index.ts's engineMcpServers
+// can resolve a live Authorization header. `& { oauthConnectionId?: string }`
+// distributes across the McpServerSpec union, so every value here is still a
+// valid McpServerSpec — the two mounting drivers, which are typed against
+// McpServerSpec, read past the extra field without ever seeing it.
+export type CustomMcpServer = McpServerSpec & { oauthConnectionId?: string };
 
 const reportedMcpSkips = new Set<string>();
 function skipMcpEntry(name: string, why: string): void {
@@ -1373,7 +1379,12 @@ export function customMcpServers(cfg: AppConfig, only?: string[]): Record<string
     }
     if (!parsed.server.enabled) continue;
     out[name] = isRemoteMcpServer(parsed.server)
-      ? { type: parsed.server.type, url: parsed.server.url, headers: parsed.server.headers }
+      ? {
+        type: parsed.server.type,
+        url: parsed.server.url,
+        headers: parsed.server.headers,
+        ...(parsed.server.oauthConnectionId ? { oauthConnectionId: parsed.server.oauthConnectionId } : {}),
+      }
       : { command: parsed.server.command, args: parsed.server.args, env: parsed.server.env };
   }
   return out;

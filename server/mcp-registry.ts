@@ -10,6 +10,11 @@ export interface StoredStdioMcpServer extends StdioMcpSpec {
 }
 export interface StoredRemoteMcpServer extends RemoteMcpSpec {
   enabled: boolean;
+  /** References a record in the OAuth connection store (server/mcp-oauth.ts)
+   * whose live access token is resolved into `headers.Authorization` at
+   * mount time (server/index.ts engineMcpServers). Mutually exclusive with
+   * an `Authorization` entry in `headers` — see parseRemote below. */
+  oauthConnectionId?: string;
 }
 export type StoredMcpServer = StoredStdioMcpServer | StoredRemoteMcpServer;
 
@@ -27,6 +32,12 @@ export interface RemoteMcpServerListing {
   url: string;
   headerKeys: string[];
   enabled: boolean;
+  /** Set when this server's Authorization header comes from a completed or
+   * pending OAuth connection (server/mcp-oauth.ts) rather than a stored
+   * header. The id is safe to expose — it names a connection record, never
+   * a token — and lets the renderer show Connect/Disconnect instead of a
+   * headers textarea. */
+  oauthConnectionId?: string;
 }
 export type McpServerListing = StdioMcpServerListing | RemoteMcpServerListing;
 
@@ -105,12 +116,15 @@ const stdioMutationSchema = stdioEntrySchema.extend({
   env: z.record(z.string(), z.union([z.string().max(16_384), z.literal(true)])).optional(),
 });
 
+const OAUTH_CONNECTION_ID = /^[A-Za-z0-9_-]{1,64}$/;
+
 const remoteEntrySchema = z.object({
   /** Streamable HTTP unless the entry says the older SSE transport. */
   type: z.enum(["http", "sse"]).optional(),
   url: z.string().trim().min(1).max(2_048),
   headers: z.record(z.string(), z.string().max(16_384)).optional(),
   enabled: z.boolean().optional(),
+  oauthConnectionId: z.string().regex(OAUTH_CONNECTION_ID).optional(),
 }).strict();
 
 const remoteMutationSchema = remoteEntrySchema.extend({
@@ -195,6 +209,12 @@ function parseRemote(raw: unknown, mutation: boolean, existing?: StoredMcpServer
   if (!headers.ok) return headers;
   const invalidHeader = Object.entries(headers.values).map(([name, value]) => headerError(name, value)).find((error) => error !== null);
   if (invalidHeader) return { ok: false, error: invalidHeader };
+  // An OAuth-backed server gets its Authorization header resolved live from
+  // the connection store (server/mcp-oauth.ts); a stored one alongside it
+  // would be dead weight at best and a confusing override at worst.
+  if (parsed.data.oauthConnectionId && Object.keys(headers.values).some((name) => name.toLowerCase() === "authorization")) {
+    return { ok: false, error: "Remove the Authorization header — it is set by the OAuth connection." };
+  }
   return {
     ok: true,
     server: {
@@ -202,6 +222,7 @@ function parseRemote(raw: unknown, mutation: boolean, existing?: StoredMcpServer
       url: parsed.data.url,
       headers: headers.values,
       enabled: enabledFor(parsed.data.enabled, mutation, existing),
+      ...(parsed.data.oauthConnectionId ? { oauthConnectionId: parsed.data.oauthConnectionId } : {}),
     },
   };
 }
@@ -244,6 +265,7 @@ export function listMcpServers(raw: Record<string, unknown> | undefined): McpSer
         url: server.url,
         headerKeys: Object.keys(server.headers).sort(),
         enabled: server.enabled,
+        ...(server.oauthConnectionId ? { oauthConnectionId: server.oauthConnectionId } : {}),
       }];
     }
     return [{
