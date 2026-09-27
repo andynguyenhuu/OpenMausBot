@@ -48,6 +48,7 @@ import {
   withoutManagedCompanionTunnelAccess,
 } from "./managed-companion-tunnel.mjs";
 import { createSecureCredentialState } from "./secure-credential-state.mjs";
+import { MCP_OAUTH_CREDENTIAL_KEY, readMcpOauthTokens } from "./mcp-oauth-tokens.mjs";
 import {
   createPhoneSecretSaveCoordinator,
   createPhoneSecretIdentity,
@@ -1236,6 +1237,54 @@ function receivePhoneSecretSave(proc, rawMessage) {
   return true;
 }
 
+/** The embedded server holds no long-lived secret store of its own — MCP
+ * OAuth connection records (client secrets, access/refresh tokens) live in
+ * credentials.bin like everything else here. This is the read/write bridge
+ * a forked server process uses to reach it: a full-snapshot load at boot,
+ * a full-snapshot save on every connect/refresh/disconnect. Shaped after
+ * receivePhoneSecretSave above, but request/response rather than fire-and-
+ * persist, since the server needs its OWN prior connections back before it
+ * can serve the management API at all. */
+function receiveMcpOauthMessage(proc, rawMessage) {
+  const message = rawMessage?.data ?? rawMessage;
+  if (!message || typeof message !== "object") return false;
+  if (message.type === "openmausbot:mcp-oauth-load" && typeof message.requestId === "string") {
+    let tokens = {};
+    try {
+      tokens = readMcpOauthTokens(secureCredentialState.read());
+    } catch (error) {
+      slog(`mcp oauth load failed: ${error?.message ?? error}`);
+    }
+    try {
+      proc.postMessage({ type: "openmausbot:mcp-oauth-load-result", requestId: message.requestId, tokens });
+    } catch (error) {
+      slog(`mcp oauth load result post failed: ${error?.message ?? error}`);
+    }
+    return true;
+  }
+  if (
+    message.type === "openmausbot:mcp-oauth-save" &&
+    typeof message.requestId === "string" &&
+    message.tokens && typeof message.tokens === "object" && !Array.isArray(message.tokens)
+  ) {
+    const requestId = message.requestId;
+    const tokens = message.tokens;
+    void updateSecureCredentialDocument((credentials) => ({ ...credentials, [MCP_OAUTH_CREDENTIAL_KEY]: tokens }))
+      .then(
+        () => proc.postMessage({ type: "openmausbot:mcp-oauth-save-result", requestId, ok: true }),
+        (error) => proc.postMessage({
+          type: "openmausbot:mcp-oauth-save-result",
+          requestId,
+          ok: false,
+          error: error?.message ?? String(error),
+        }),
+      )
+      .catch((error) => slog(`mcp oauth save result post failed: ${error?.message ?? error}`));
+    return true;
+  }
+  return false;
+}
+
 async function startServerOn(port) {
   if (desktopShutdownStarted) return { proc: null, abort: true };
   const entry = path.join(process.resourcesPath, "server", "index.js");
@@ -1259,6 +1308,15 @@ async function startServerOn(port) {
     OMB_USER_DATA: app.getPath("userData"),
     ...(secureCredentials.composioApiKey
       ? { COMPOSIO_API_KEY: secureCredentials.composioApiKey }
+      : {}),
+    // The managed companion tunnel's public hostname, if one has been
+    // provisioned — the only redirect target a remote OAuth authorization
+    // server can reach for server/mcp-oauth.ts. A snapshot at spawn, same as
+    // COMPOSIO_API_KEY above: a tunnel provisioned after this boot needs a
+    // relaunch to be picked up, which matches how every other credential
+    // here already behaves.
+    ...(managedCompanionTunnelAccess(secureCredentials)?.endpoint
+      ? { OMB_MANAGED_ENDPOINT_URL: managedCompanionTunnelAccess(secureCredentials).endpoint }
       : {}),
     // "we could not read your keys" must not reach the UI as "you have none"
     OMB_CREDENTIAL_STORE: credentialStoreUnavailable ? "unavailable" : "ok",
@@ -1286,6 +1344,7 @@ async function startServerOn(port) {
       if (managedDesktopRelay.receive(proc, message)) return;
       if (orgLibrary?.receive(message)) return;
       if (receivePhoneSecretSave(proc, message)) return;
+      if (receiveMcpOauthMessage(proc, message)) return;
     } catch (error) {
       slog(`desktop private sync rejected: ${error?.message ?? error}`);
     }
