@@ -9,8 +9,26 @@ import { afterEach, describe, expect, it } from "vitest";
 import { json, readBody } from "../harness/http.ts";
 import { McpOAuthConnections } from "../mcp-oauth.ts";
 import { inMemoryMcpOAuthPersistence, McpOAuthStore } from "../mcp-oauth-store.ts";
+import type { RequestAuth } from "../request-auth.ts";
+import type { SessionRecord } from "../sessions.ts";
 import { createMcpOAuthRoutes } from "./mcp-oauth.ts";
 import { dispatchRoutes } from "./table.ts";
+
+/** A fake account session, distinguished only by email — enough to exercise
+ * the ownership check without a real SessionRegistry. */
+function fakeSessionAuth(email: string): RequestAuth {
+  const session: SessionRecord = {
+    id: `sess-${email}`,
+    tokenHash: "0".repeat(64),
+    label: "Test client",
+    scopes: ["admin", "client"],
+    createdAt: 0,
+    lastSeenAt: 0,
+    expiresAt: Number.MAX_SAFE_INTEGER,
+    email,
+  };
+  return { kind: "session", session, via: "cookie", scopes: ["admin", "client"] };
+}
 
 const RESOURCE = "https://mcp.clickup.com/mcp";
 const AS_ISSUER = "https://auth.clickup.com";
@@ -55,15 +73,24 @@ afterEach(async () => {
   await Promise.all(servers.splice(0).map((server) => new Promise((done) => server.close(done))));
 });
 
+/** A request may set this header to be treated as a signed-in account
+ * (identified by the email given) instead of the default loopback caller. */
+const TEST_OWNER_HEADER = "x-test-owner-email";
+
 async function serve(routes: Record<string, Route> = happyPathRoutes(), callbackOrigin: () => string | null = () => CALLBACK_ORIGIN) {
   const store = new McpOAuthStore(inMemoryMcpOAuthPersistence());
   const connections = new McpOAuthConnections({ store, fetchImpl: fakeFetch(routes), callbackOrigin });
-  const routeTable = [createMcpOAuthRoutes({ connections, ownerLabel: () => "andy" })];
+  const routeTable = [createMcpOAuthRoutes({
+    connections,
+    ownerLabel: (auth) => (auth.kind === "session" ? auth.session.email : "andy"),
+  })];
   const server = createServer(async (req, res) => {
     const url = new URL(req.url ?? "/", "http://localhost");
+    const ownerEmail = req.headers[TEST_OWNER_HEADER];
+    const auth: RequestAuth = typeof ownerEmail === "string" ? fakeSessionAuth(ownerEmail) : { kind: "loopback", scopes: ["admin", "client"] };
     const handled = await dispatchRoutes(routeTable, {
       req, res, url, path: url.pathname, method: req.method ?? "GET",
-      auth: { kind: "loopback", scopes: ["admin", "client"] }, json, readBody,
+      auth, json, readBody,
     });
     if (!handled) json(res, 404, { from: "inline routes" });
   });
@@ -189,5 +216,93 @@ describe("/api/mcp-oauth/connections through the route table", () => {
     const deleted = await fetch(`${base}/api/mcp-oauth/connections/${started.connectionId}`, { method: "DELETE" });
     expect(deleted.status).toBe(200);
     expect(store.get(started.connectionId)).toBeUndefined();
+  });
+});
+
+describe("ownership: disconnect/restart is scoped to the account that created the connection", () => {
+  it("refuses to DELETE a connection created by a different account", async () => {
+    const { base } = await serve();
+    const started = await (
+      await fetch(`${base}/api/mcp-oauth/connections`, {
+        method: "POST",
+        headers: { "content-type": "application/json", [TEST_OWNER_HEADER]: "ada@example.test" },
+        body: JSON.stringify({ serverUrl: RESOURCE }),
+      })
+    ).json() as { connectionId: string };
+
+    const deniedDelete = await fetch(`${base}/api/mcp-oauth/connections/${started.connectionId}`, {
+      method: "DELETE",
+      headers: { [TEST_OWNER_HEADER]: "bob@example.test" },
+    });
+    expect(deniedDelete.status).toBe(403);
+    expect(((await deniedDelete.json()) as { error: string }).error).toMatch(/different account/);
+
+    // the account that created it may still disconnect it
+    const okDelete = await fetch(`${base}/api/mcp-oauth/connections/${started.connectionId}`, {
+      method: "DELETE",
+      headers: { [TEST_OWNER_HEADER]: "ada@example.test" },
+    });
+    expect(okDelete.status).toBe(200);
+  });
+
+  it("refuses to restart (re-POST with the same connectionId) a connection created by a different account", async () => {
+    const { base } = await serve();
+    const started = await (
+      await fetch(`${base}/api/mcp-oauth/connections`, {
+        method: "POST",
+        headers: { "content-type": "application/json", [TEST_OWNER_HEADER]: "ada@example.test" },
+        body: JSON.stringify({ serverUrl: RESOURCE }),
+      })
+    ).json() as { connectionId: string };
+
+    const restart = await fetch(`${base}/api/mcp-oauth/connections`, {
+      method: "POST",
+      headers: { "content-type": "application/json", [TEST_OWNER_HEADER]: "bob@example.test" },
+      body: JSON.stringify({ serverUrl: RESOURCE, connectionId: started.connectionId }),
+    });
+    expect(restart.status).toBe(403);
+
+    // the account that created it may still restart it
+    const ownRestart = await fetch(`${base}/api/mcp-oauth/connections`, {
+      method: "POST",
+      headers: { "content-type": "application/json", [TEST_OWNER_HEADER]: "ada@example.test" },
+      body: JSON.stringify({ serverUrl: RESOURCE, connectionId: started.connectionId }),
+    });
+    expect(ownRestart.status).toBe(201);
+  });
+
+  it("a loopback/local-operator caller may disconnect any connection regardless of who created it", async () => {
+    const { base } = await serve();
+    const started = await (
+      await fetch(`${base}/api/mcp-oauth/connections`, {
+        method: "POST",
+        headers: { "content-type": "application/json", [TEST_OWNER_HEADER]: "ada@example.test" },
+        body: JSON.stringify({ serverUrl: RESOURCE }),
+      })
+    ).json() as { connectionId: string };
+
+    // no TEST_OWNER_HEADER => the default loopback caller in serve()
+    const deleted = await fetch(`${base}/api/mcp-oauth/connections/${started.connectionId}`, { method: "DELETE" });
+    expect(deleted.status).toBe(200);
+  });
+
+  it("does not block a DELETE/restart when no owner was ever recorded (e.g. a legacy connection)", async () => {
+    const { base, store } = await serve();
+    const started = await (
+      await fetch(`${base}/api/mcp-oauth/connections`, {
+        method: "POST",
+        headers: { "content-type": "application/json" }, // default loopback caller: ownerLabel "andy"
+        body: JSON.stringify({ serverUrl: RESOURCE }),
+      })
+    ).json() as { connectionId: string };
+    // Simulate a pre-existing record with no ownerLabel at all.
+    const record = store.get(started.connectionId)!;
+    await store.upsert({ ...record, ownerLabel: undefined });
+
+    const deleted = await fetch(`${base}/api/mcp-oauth/connections/${started.connectionId}`, {
+      method: "DELETE",
+      headers: { [TEST_OWNER_HEADER]: "someone-else@example.test" },
+    });
+    expect(deleted.status).toBe(200);
   });
 });

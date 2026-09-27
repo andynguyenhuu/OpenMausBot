@@ -13047,7 +13047,13 @@ const orgInstallStatuses = () => orgLibrary?.installStatuses() ?? new Map();
 ROUTES.push(createBotPresetRoutes({ presets: presetStore, orgStatuses: orgInstallStatuses }));
 ROUTES.push(createMcpOAuthRoutes({
   connections: mcpOAuthConnections,
-  ownerLabel: (auth) => (auth.kind === "session" ? auth.session.label : auth.kind),
+  // A stable per-account identity where one exists (a hosted workspace can
+  // have more than one admin-scope email — see server/people-invite.test.ts),
+  // falling back to the per-device label for a session with no account (a
+  // bare pairing code) and to the auth kind for a loopback caller. This is
+  // both the audit field on the connection record and the identity the
+  // ownership check in server/routes/mcp-oauth.ts compares against.
+  ownerLabel: (auth) => (auth.kind === "session" ? (auth.session.email ?? auth.session.userId ?? auth.session.label) : auth.kind),
 }));
 
 const toolResults = new ToolResults();

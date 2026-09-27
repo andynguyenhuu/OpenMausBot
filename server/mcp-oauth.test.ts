@@ -101,6 +101,44 @@ describe("McpOAuthConnections.start (discovery + DCR + PKCE)", () => {
     const { conn } = connections(routes);
     await expect(conn.start({ connectionId: "conn-1", serverUrl: RESOURCE })).rejects.toThrow(/dynamic client registration/);
   });
+
+  it("invalidates a different owner's pending flow when a second owner starts for the same connectionId", async () => {
+    const routes = happyPathRoutes({
+      [`${AS_ISSUER}/token`]: { body: { access_token: "at-bob", expires_in: 3600 } },
+    });
+    const { conn, store } = connections(routes);
+    const first = await conn.start({ connectionId: "conn-1", serverUrl: RESOURCE, ownerLabel: "ada@example.test" });
+    const firstState = new URL(first.authorizationUrl).searchParams.get("state")!;
+    expect(store.get("conn-1")?.ownerLabel).toBe("ada@example.test");
+
+    const second = await conn.start({ connectionId: "conn-1", serverUrl: RESOURCE, ownerLabel: "bob@example.test" });
+    const secondState = new URL(second.authorizationUrl).searchParams.get("state")!;
+    expect(store.get("conn-1")?.ownerLabel).toBe("bob@example.test");
+
+    // Ada's superseded state can no longer complete a flow...
+    const replay = await conn.complete("conn-1", { code: "ada-code", state: firstState });
+    expect(replay).toEqual({ ok: false, error: "This authorization link was already used or has expired." });
+
+    // ...but Bob's own state still works.
+    const result = await conn.complete("conn-1", { code: "bob-code", state: secondState });
+    expect(result).toEqual({ ok: true });
+    expect(store.get("conn-1")?.accessToken).toBe("at-bob");
+  });
+
+  it("does not invalidate the SAME owner's pending flow when they start() again", async () => {
+    const routes = happyPathRoutes({
+      [`${AS_ISSUER}/token`]: { body: { access_token: "at-1", expires_in: 3600 } },
+    });
+    const { conn } = connections(routes);
+    const first = await conn.start({ connectionId: "conn-1", serverUrl: RESOURCE, ownerLabel: "ada@example.test" });
+    const firstState = new URL(first.authorizationUrl).searchParams.get("state")!;
+    await conn.start({ connectionId: "conn-1", serverUrl: RESOURCE, ownerLabel: "ada@example.test" });
+
+    // Same owner's earlier state is untouched (start() only discards a
+    // DIFFERENT owner's pending flow).
+    const result = await conn.complete("conn-1", { code: "c", state: firstState });
+    expect(result).toEqual({ ok: true });
+  });
 });
 
 describe("McpOAuthConnections.complete (callback + token exchange)", () => {
@@ -145,12 +183,63 @@ describe("McpOAuthConnections.complete (callback + token exchange)", () => {
     expect(result).toEqual({ ok: false, error: "This authorization link does not belong to this connection." });
   });
 
-  it("records an authorization-server error callback without ever calling the token endpoint", async () => {
+  it("records an authorization-server error callback without ever calling the token endpoint, given a valid state", async () => {
     const { conn, store } = connections(happyPathRoutes());
-    await conn.start({ connectionId: "conn-1", serverUrl: RESOURCE });
-    const result = await conn.complete("conn-1", { error: "access_denied", errorDescription: "user declined" });
+    const started = await conn.start({ connectionId: "conn-1", serverUrl: RESOURCE });
+    const state = new URL(started.authorizationUrl).searchParams.get("state")!;
+    const result = await conn.complete("conn-1", { error: "access_denied", errorDescription: "user declined", state });
     expect(result).toEqual({ ok: false, error: "user declined" });
     expect(store.get("conn-1")?.status).toBe("error");
+  });
+
+  it("an error callback with NO state parameter never touches the stored record (the vulnerability this guards against)", async () => {
+    const routes = happyPathRoutes({
+      [`${AS_ISSUER}/token`]: { body: { access_token: "at-1", expires_in: 3600 } },
+    });
+    const { conn, store } = connections(routes);
+    const started = await conn.start({ connectionId: "conn-1", serverUrl: RESOURCE });
+    const state = new URL(started.authorizationUrl).searchParams.get("state")!;
+    await conn.complete("conn-1", { code: "the-code", state });
+    expect(store.get("conn-1")?.status).toBe("connected");
+
+    // An anonymous caller who merely knows the connectionId hits the
+    // pre-auth callback with an error and no state at all.
+    const result = await conn.complete("conn-1", { error: "access_denied" });
+    expect(result).toEqual({ ok: false, error: "The callback did not include a state parameter." });
+    expect(store.get("conn-1")?.status).toBe("connected");
+    expect(store.get("conn-1")?.error).toBeUndefined();
+  });
+
+  it("an error callback with an invalid/unknown state never touches the stored record", async () => {
+    const routes = happyPathRoutes({
+      [`${AS_ISSUER}/token`]: { body: { access_token: "at-1", expires_in: 3600 } },
+    });
+    const { conn, store } = connections(routes);
+    const started = await conn.start({ connectionId: "conn-1", serverUrl: RESOURCE });
+    const state = new URL(started.authorizationUrl).searchParams.get("state")!;
+    await conn.complete("conn-1", { code: "the-code", state });
+    expect(store.get("conn-1")?.status).toBe("connected");
+
+    const result = await conn.complete("conn-1", { error: "access_denied", state: "not-a-real-state" });
+    expect(result).toEqual({ ok: false, error: "This authorization link was already used or has expired." });
+    expect(store.get("conn-1")?.status).toBe("connected");
+  });
+
+  it("rejects a replayed state after it was already consumed by an error callback", async () => {
+    const { conn, store } = connections(happyPathRoutes());
+    const started = await conn.start({ connectionId: "conn-1", serverUrl: RESOURCE });
+    const state = new URL(started.authorizationUrl).searchParams.get("state")!;
+    const first = await conn.complete("conn-1", { error: "access_denied", errorDescription: "user declined", state });
+    expect(first).toEqual({ ok: false, error: "user declined" });
+    expect(store.get("conn-1")?.status).toBe("error");
+
+    // Replaying the same state — whether as another error or as a code —
+    // must not be honoured a second time.
+    const replayAsError = await conn.complete("conn-1", { error: "access_denied", state });
+    expect(replayAsError).toEqual({ ok: false, error: "This authorization link was already used or has expired." });
+
+    const replayAsCode = await conn.complete("conn-1", { code: "late-code", state });
+    expect(replayAsCode).toEqual({ ok: false, error: "This authorization link was already used or has expired." });
   });
 
   it("marks the connection errored when the token endpoint refuses the exchange", async () => {

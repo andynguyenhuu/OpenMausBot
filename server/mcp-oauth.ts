@@ -149,6 +149,15 @@ export class McpOAuthConnections {
         502,
       );
     }
+    const existing = this.store.get(input.connectionId);
+    if (existing?.status === "pending" && existing.ownerLabel !== input.ownerLabel) {
+      // A different owner already has an in-flight authorization for this
+      // connectionId (e.g. two accounts both hit Connect on the same MCP
+      // server entry). Invalidate their pending state so a late callback
+      // cannot complete behind the new caller's back, then let this start()
+      // proceed and become the flow of record.
+      this.flows.discardForConnection(input.connectionId);
+    }
     const redirectUri = callbackUrl(origin, input.connectionId);
     let client: Awaited<ReturnType<typeof registerDynamicClient>>;
     try {
@@ -182,7 +191,6 @@ export class McpOAuthConnections {
     authorizationUrl.searchParams.set("resource", resourceMeta.resource);
 
     const nowIso = new Date(this.now()).toISOString();
-    const existing = this.store.get(input.connectionId);
     const record: McpOAuthConnectionRecord = {
       connectionId: input.connectionId,
       serverName: input.serverName ?? existing?.serverName,
@@ -206,15 +214,20 @@ export class McpOAuthConnections {
 
   /** Called from the pre-auth GET /oauth/mcp/callback/:connectionId route.
    * `state` is the entire security boundary here — there is no session to
-   * check this request against. */
+   * check this request against, so it MUST be validated (and consumed,
+   * single-use) before any branch below is allowed to mutate the stored
+   * record. Without that ordering, anyone who knows or guesses a
+   * connectionId could hit this route with `?error=x` and no state at all
+   * and flip a working connection to `status: "error"` — an unauthenticated
+   * way to break every bot mounting that MCP server. */
   async complete(connectionId: string, params: { code?: string; state?: string; error?: string; errorDescription?: string }): Promise<CompleteMcpOAuthResult> {
+    if (!params.state) return { ok: false, error: "The callback did not include a state parameter." };
+    const consumed = this.flows.consume(connectionId, params.state);
+    if (!consumed.ok) return consumed;
     if (params.error) {
       await this.markError(connectionId, params.errorDescription || params.error);
       return { ok: false, error: params.errorDescription || params.error };
     }
-    if (!params.state) return { ok: false, error: "The callback did not include a state parameter." };
-    const consumed = this.flows.consume(connectionId, params.state);
-    if (!consumed.ok) return consumed;
     if (!params.code) {
       await this.markError(connectionId, "The callback did not include an authorization code.");
       return { ok: false, error: "The callback did not include an authorization code." };
