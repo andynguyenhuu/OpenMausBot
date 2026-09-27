@@ -126,11 +126,41 @@ describe("what the app may do", () => {
     ["POST", "/api/bots/bot_123/connector-cards/msg_2/dismiss"],
     ["POST", "/api/bots/bot_123/secret-cards/msg_2/resume"],
     ["POST", "/api/bots/bot_123/secret-cards/msg_2/dismiss"],
+    ["GET", "/api/mcp-oauth/connections"],
+    ["POST", "/api/mcp-oauth/connections"],
+    ["GET", "/api/mcp-oauth/connections/conn_123"],
+    ["DELETE", "/api/mcp-oauth/connections/conn_123"],
   ];
 
   for (const [method, path] of calls) {
     it(`allows ${method} ${path}`, () => expect(ask(method, path)).toBeNull());
   }
+});
+
+describe("mcp-oauth connections", () => {
+  it("requires pairing, same as every other allowed route", () => {
+    expect(ask("GET", "/api/mcp-oauth/connections", false)?.status).toBe(401);
+    expect(ask("POST", "/api/mcp-oauth/connections", false)?.status).toBe(401);
+    expect(ask("GET", "/api/mcp-oauth/connections/conn_123", false)?.status).toBe(401);
+    expect(ask("DELETE", "/api/mcp-oauth/connections/conn_123", false)?.status).toBe(401);
+  });
+
+  it("does not widen into server-wide mcp config", () => {
+    // The static-server CRUD surface (/api/mcp/servers) stays desktop-only —
+    // adding the connections routes above must not accidentally match it.
+    expect(ask("GET", "/api/mcp/servers")?.status).toBe(404);
+    expect(ask("POST", "/api/mcp/servers")?.status).toBe(404);
+    expect(ask("PATCH", "/api/mcp/servers/clickup")?.status).toBe(404);
+  });
+
+  it("only matches the exact connections shapes, not neighbours or path traversal", () => {
+    expect(ask("PUT", "/api/mcp-oauth/connections")?.status).toBe(404);
+    expect(ask("PATCH", "/api/mcp-oauth/connections/conn_123")?.status).toBe(404);
+    expect(ask("GET", "/api/mcp-oauth/connections/")?.status).toBe(404);
+    expect(ask("GET", "/api/mcp-oauth/connections/conn_123/extra")?.status).toBe(404);
+    expect(ask("GET", `/api/mcp-oauth/connections/${"a".repeat(65)}`)?.status).toBe(404);
+    expect(ask("GET", "/api/mcp-oauth/connections/../connections")?.status).toBe(404);
+  });
 });
 
 describe("what it may not", () => {

@@ -215,6 +215,19 @@ const ALLOWED: ReadonlyArray<{ method: string; path: RegExp }> = [
   // claim that it stored a host credential. Saving and `provided` stay local
   // to the host's OS-backed credential store.
   { method: "POST", path: /^\/api\/bots\/[\w-]+\/secret-cards\/[\w-]+\/(?:resume|dismiss)$/ },
+
+  // MCP OAuth connections: status and (re)connect for a remote MCP server's
+  // OAuth handshake. The handler itself (server/routes/mcp-oauth.ts) already
+  // gates disconnect/restart by the requesting identity's ownerLabel, so the
+  // phone gets exactly the same connect-or-view surface a paired session on
+  // the desktop UI already has — nothing wider. Server-wide config (adding
+  // or editing the mcpServers entry an OAuth connection attaches to) is not
+  // opened here; that stays desktop-only, same as every other /api/mcp/*
+  // write.
+  { method: "GET", path: /^\/api\/mcp-oauth\/connections$/ },
+  { method: "POST", path: /^\/api\/mcp-oauth\/connections$/ },
+  { method: "GET", path: /^\/api\/mcp-oauth\/connections\/[\w-]{1,64}$/ },
+  { method: "DELETE", path: /^\/api\/mcp-oauth\/connections\/[\w-]{1,64}$/ },
 ];
 
 /** Route families worth naming in the refusal.
