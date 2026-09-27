@@ -37,6 +37,9 @@ interface RemoteMcpListing {
   url: string;
   headerKeys: string[];
   enabled: boolean;
+  /** Set once this server is wired to a connection from
+   * /api/mcp-oauth/connections instead of a static Authorization header. */
+  oauthConnectionId?: string;
 }
 /** managedBy: the enrolled organisation has not approved this server, so it
  * stays configured but never reaches bots. */
@@ -57,6 +60,19 @@ interface McpDraft {
   type: "http" | "sse";
   url: string;
   headers: string;
+  oauthConnectionId?: string;
+}
+
+/** The subset of a management-API connection summary this panel reads —
+ * see server/mcp-oauth-store.ts's McpOAuthConnectionSummary for the full
+ * shape (this deliberately only names the fields used here). */
+interface McpOAuthConnectionSummary {
+  connectionId: string;
+  status: "pending" | "connected" | "expired" | "error";
+  serverUrl: string;
+  serverName?: string;
+  error?: string;
+  updatedAt: string;
 }
 
 interface ProbeResult {
@@ -128,6 +144,19 @@ function probeToolsLabel(tools: ProbeResult["tools"]): string {
     : t("mcp.probe.toolsMany", { count: tools.length, names });
 }
 
+function oauthStatusLabel(status: McpOAuthConnectionSummary["status"] | undefined): string {
+  if (status === "connected") return t("mcp.oauth.status.connected");
+  if (status === "error") return t("mcp.oauth.status.error");
+  if (status === "expired") return t("mcp.oauth.status.expired");
+  return t("mcp.oauth.status.pending");
+}
+
+function oauthStatusClass(status: McpOAuthConnectionSummary["status"] | undefined): string {
+  if (status === "connected") return "bg-success/10 text-success";
+  if (status === "error" || status === "expired") return "bg-danger/10 text-danger";
+  return "bg-raised text-ink-secondary";
+}
+
 function draftFor(server: McpServerListing): McpDraft {
   // Values are intentionally never returned by the server. A blank value
   // beside an existing key is a write-only “keep saved value” placeholder.
@@ -139,6 +168,7 @@ function draftFor(server: McpServerListing): McpDraft {
       type: server.type,
       url: server.url,
       headers: server.headerKeys.map((key) => `${key}: `).join("\n"),
+      oauthConnectionId: server.oauthConnectionId,
     };
   }
   return {
@@ -164,6 +194,8 @@ export function McpServersPanel() {
   const [probe, setProbe] = useState<Record<string, ProbeResult>>({});
   const [importOpen, setImportOpen] = useState(false);
   const [importText, setImportText] = useState("");
+  const [oauthConnections, setOauthConnections] = useState<Record<string, McpOAuthConnectionSummary>>({});
+  const [oauthBusy, setOauthBusy] = useState<string | null>(null);
   const loadGeneration = useRef(0);
 
   // Paste-to-add: the same block Claude Code, Cursor and Claude Desktop
@@ -196,11 +228,21 @@ export function McpServersPanel() {
     const generation = ++loadGeneration.current;
     setBusy("load");
     setError(null);
-    return api("/api/mcp/servers")
-      .then((result) => {
+    return Promise.all([
+      api("/api/mcp/servers"),
+      // OAuth connections are a separate, optional feature — a machine with
+      // no public callback origin yet still shows its plain server list.
+      api("/api/mcp-oauth/connections").catch(() => ({ connections: [] as McpOAuthConnectionSummary[] })),
+    ])
+      .then(([result, oauth]) => {
         if (generation === loadGeneration.current) {
           setServers(result.servers ?? []);
           updateMcpServers(result.servers ?? []);
+          setOauthConnections(
+            Object.fromEntries(
+              ((oauth.connections ?? []) as McpOAuthConnectionSummary[]).map((connection) => [connection.connectionId, connection]),
+            ),
+          );
         }
       })
       .catch((cause) => {
@@ -231,7 +273,15 @@ export function McpServersPanel() {
       if (!name || !/^https?:\/\//i.test(url)) return { ok: false, error: { key: "mcp.err.nameAndUrl" } };
       const parsed = parseMcpHeaders(draft.headers, existing && isRemoteMcpListing(existing) ? existing.headerKeys : []);
       if (!parsed.ok) return parsed;
-      return { ok: true, body: { type: draft.type, url, headers: parsed.headers } };
+      return {
+        ok: true,
+        body: {
+          type: draft.type,
+          url,
+          headers: parsed.headers,
+          ...(draft.oauthConnectionId ? { oauthConnectionId: draft.oauthConnectionId } : {}),
+        },
+      };
     }
     const command = draft.command.trim();
     if (!name || !command) return { ok: false, error: { key: "mcp.err.nameAndCommand" } };
@@ -341,6 +391,91 @@ export function McpServersPanel() {
       setBusy(null);
     }
   };
+
+  // Starts (or restarts, reusing the same connectionId) an OAuth handshake
+  // for the server URL currently in the editor, then opens the
+  // authorization page in a new tab. The connection exists independently of
+  // the mcpServers entry — Save still has to be clicked afterwards to store
+  // oauthConnectionId on the server itself.
+  const startOAuthConnection = async () => {
+    const url = draft.url.trim();
+    if (!/^https?:\/\//i.test(url)) {
+      setError({ key: "mcp.err.nameAndUrl" });
+      return;
+    }
+    setOauthBusy("start");
+    setError(null);
+    try {
+      const result = await api("/api/mcp-oauth/connections", {
+        method: "POST",
+        body: JSON.stringify({
+          serverUrl: url,
+          serverName: draft.name.trim() || undefined,
+          connectionId: draft.oauthConnectionId || undefined,
+        }),
+      });
+      setDraft((current) => ({ ...current, oauthConnectionId: result.connectionId }));
+      setOauthConnections((current) => ({
+        ...current,
+        [result.connectionId as string]: {
+          connectionId: result.connectionId,
+          status: "pending",
+          serverUrl: url,
+          serverName: draft.name.trim() || undefined,
+          updatedAt: new Date().toISOString(),
+        },
+      }));
+      window.open(result.authorizationUrl, "_blank", "noopener,noreferrer");
+      setNotice({ key: "mcp.oauth.opened" });
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setOauthBusy(null);
+    }
+  };
+
+  const refreshOauthStatus = useCallback(async (connectionId: string) => {
+    try {
+      const summary = await api(`/api/mcp-oauth/connections/${connectionId}`);
+      setOauthConnections((current) => ({ ...current, [connectionId]: summary }));
+    } catch {
+      // Transient — the next poll tick tries again.
+    }
+  }, []);
+
+  // Deletes the connection itself (tokens included). The saved server entry
+  // still has oauthConnectionId set until Save is clicked — draftBody omits
+  // it once cleared here, and headers are re-sent from existing.headerKeys
+  // so a PUT that only changes oauthConnectionId never wipes them.
+  const disconnectOAuthConnection = async () => {
+    const connectionId = draft.oauthConnectionId;
+    if (!connectionId) return;
+    setOauthBusy("disconnect");
+    setError(null);
+    try {
+      await api(`/api/mcp-oauth/connections/${connectionId}`, { method: "DELETE" });
+      setOauthConnections((current) => {
+        const next = { ...current };
+        delete next[connectionId];
+        return next;
+      });
+      setDraft((current) => ({ ...current, oauthConnectionId: undefined }));
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setOauthBusy(null);
+    }
+  };
+
+  // While the editor is open on a server with a pending connection, poll
+  // for the callback landing — the tab that opened it isn't this one.
+  const pendingConnectionId = draft.oauthConnectionId;
+  const pendingStatus = pendingConnectionId ? oauthConnections[pendingConnectionId]?.status : undefined;
+  useEffect(() => {
+    if (!editing || !pendingConnectionId || pendingStatus === "connected" || pendingStatus === "error") return;
+    const timer = setInterval(() => { void refreshOauthStatus(pendingConnectionId); }, 2500);
+    return () => clearInterval(timer);
+  }, [editing, pendingConnectionId, pendingStatus, refreshOauthStatus]);
 
   return (
     <div className="min-h-0 flex-1 overflow-y-auto px-6 pb-7 pt-5 sm:px-8">
@@ -512,6 +647,53 @@ export function McpServersPanel() {
                     />
                     <span className="mt-1.5 block text-[11px] text-ink-secondary">{t("mcp.headersHint")}</span>
                   </label>
+                  <div className="block rounded-xl border border-hairline/50 bg-raised/40 p-3 sm:col-span-2">
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                      <div className="min-w-0">
+                        <div className="text-[12.5px] font-medium text-ink">{t("mcp.oauth.title")}</div>
+                        <p className="mt-0.5 text-[11.5px] leading-relaxed text-ink-secondary">{t("mcp.oauth.hint")}</p>
+                      </div>
+                      {!draft.oauthConnectionId && (
+                        <button
+                          type="button"
+                          disabled={oauthBusy !== null || !/^https?:\/\//i.test(draft.url.trim())}
+                          onClick={() => void startOAuthConnection()}
+                          className="flex shrink-0 items-center gap-1.5 rounded-lg bg-control px-3 py-2 text-[12px] font-medium text-ink hover:bg-raised-hover disabled:opacity-40"
+                        >
+                          {oauthBusy === "start" && <Loader2 size={13} className="animate-spin" />} {t("mcp.oauth.connectButton")}
+                        </button>
+                      )}
+                    </div>
+                    {draft.oauthConnectionId && (
+                      <div className="mt-2.5 flex flex-wrap items-center gap-2">
+                        <span className={cn("rounded-full px-2 py-0.5 text-[10.5px]", oauthStatusClass(oauthConnections[draft.oauthConnectionId]?.status))}>
+                          {oauthStatusLabel(oauthConnections[draft.oauthConnectionId]?.status)}
+                        </span>
+                        {oauthConnections[draft.oauthConnectionId]?.error && (
+                          <span className="text-[11px] text-danger">{oauthConnections[draft.oauthConnectionId]?.error}</span>
+                        )}
+                        {(oauthConnections[draft.oauthConnectionId]?.status === "error" || oauthConnections[draft.oauthConnectionId]?.status === "expired") && (
+                          <button
+                            type="button"
+                            disabled={oauthBusy !== null}
+                            onClick={() => void startOAuthConnection()}
+                            className="rounded-lg bg-control px-2.5 py-1.5 text-[11.5px] font-medium text-ink hover:bg-raised-hover disabled:opacity-40"
+                          >
+                            {oauthBusy === "start" && <Loader2 size={12} className="mr-1 inline animate-spin" />}{t("mcp.oauth.reconnectButton")}
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          disabled={oauthBusy !== null}
+                          onClick={() => void disconnectOAuthConnection()}
+                          aria-label={t("mcp.oauth.disconnectAria")}
+                          className="rounded-lg px-2.5 py-1.5 text-[11.5px] font-medium text-ink-secondary hover:bg-danger/10 hover:text-danger disabled:opacity-40"
+                        >
+                          {oauthBusy === "disconnect" && <Loader2 size={12} className="mr-1 inline animate-spin" />}{t("mcp.oauth.disconnectButton")}
+                        </button>
+                      </div>
+                    )}
+                  </div>
                 </>
               ) : (
                 <>
@@ -586,6 +768,11 @@ export function McpServersPanel() {
                         <span className="truncate text-[14px] font-medium text-ink">{server.name}</span>
                         <span className={cn("rounded-full px-2 py-0.5 text-[10.5px]", server.enabled ? "bg-success/10 text-success" : "bg-raised text-ink-secondary")}>{t(server.enabled ? "mcp.badge.on" : "mcp.badge.off")}</span>
                         {server.managedBy && <span className="rounded-full bg-raised px-2 py-0.5 text-[10.5px] text-ink-secondary">{t("policy.managedBy", { organization: server.managedBy })}</span>}
+                        {isRemoteMcpListing(server) && server.oauthConnectionId && (
+                          <span className={cn("rounded-full px-2 py-0.5 text-[10.5px]", oauthStatusClass(oauthConnections[server.oauthConnectionId]?.status))}>
+                            {oauthStatusLabel(oauthConnections[server.oauthConnectionId]?.status)}
+                          </span>
+                        )}
                       </div>
                       {server.managedBy && <div className="mt-1 text-[11.5px] text-ink-secondary">{t("policy.mcpBlocked", { organization: server.managedBy })}</div>}
                       <div className="mt-1 truncate font-mono text-[11.5px] text-ink-secondary">{isRemoteMcpListing(server) ? server.url : [server.command, ...server.args].join(" ")}</div>
