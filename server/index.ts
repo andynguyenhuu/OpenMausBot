@@ -162,6 +162,7 @@ import {
   EVENTS_DIR,
   NATIVE_DIR,
   customMcpServers,
+  type CustomMcpServer,
   roomHandoffLimits,
   onConfigSaved,
 } from "./config.ts";
@@ -188,6 +189,7 @@ import {
   type RuntimeEvent,
   type SteerOutcome,
   newId,
+  type McpServerSpec,
 } from "./contracts.ts";
 import { RETRY_MAX_ATTEMPTS } from "./drivers/retry.ts";
 import { decodeGeneratedImage } from "./generated-image.ts";
@@ -543,6 +545,10 @@ import { json, onJsonBody, parsedBodyOf, readBody } from "./harness/http.ts";
 import { ROUTES, dispatchRoutes } from "./routes/table.ts";
 import { createHostedSlackRoutes } from "./routes/hosted-slack.ts";
 import { createBotPresetRoutes } from "./routes/bot-presets.ts";
+import { McpOAuthConnections } from "./mcp-oauth.ts";
+import { localFileMcpOAuthPersistence, McpOAuthStore } from "./mcp-oauth-store.ts";
+import { McpOAuthElectronBridge } from "./mcp-oauth-electron-bridge.ts";
+import { createMcpOAuthRoutes } from "./routes/mcp-oauth.ts";
 
 const PORT = Number(process.env.OMB_PORT || process.env.OGB_PORT || 8799);
 const WEBHOOK_PORT = Number(process.env.OMB_WEBHOOK_PORT || PORT + 1);
@@ -1341,6 +1347,27 @@ const browserCleanup: BrowserCleanupCoordinator = new BrowserCleanupCoordinator(
   },
 });
 const phoneSecrets = new PhoneSecretBridge(postDesktopPrivateMessage);
+// MCP OAuth connection tokens: the Electron desktop bridges to the same
+// OS-encrypted credentials.bin every other secret lives in (see
+// server/mcp-oauth-electron-bridge.ts and electron/mcp-oauth-tokens.mjs). A
+// plain Node/dev/test launch has no such parent, so it falls back to a local
+// JSON file under the data dir — durable across restarts, but not
+// OS-encrypted; documented as a known limitation in mcp-oauth-store.ts.
+const mcpOAuthPersistence = utilityParentPort
+  ? new McpOAuthElectronBridge(utilityParentPort)
+  : localFileMcpOAuthPersistence(join(DATA_DIR, "mcp-oauth-tokens.json"));
+const mcpOAuthStore = new McpOAuthStore(mcpOAuthPersistence);
+// The only public address a remote authorization server can redirect back
+// to from a phone: the managed Cloudflare Tunnel hostname (snapshotted into
+// this child's environment at spawn — see electron/main.mjs's
+// OMB_MANAGED_ENDPOINT_URL) or, for a headless `serve --tunnel`/reverse-proxy
+// launch, whatever OMB_PUBLIC_URL the operator already sets for that path.
+// Computed fresh per call, never cached, since a managed endpoint can be
+// provisioned after this process started.
+const mcpOAuthConnections = new McpOAuthConnections({
+  store: mcpOAuthStore,
+  callbackOrigin: () => process.env.OMB_MANAGED_ENDPOINT_URL?.trim().replace(/\/+$/, "") || FALLBACK_PUBLIC_URL,
+});
 utilityParentPort?.on("message", (event) => {
   const message = event?.data;
   try {
@@ -2803,7 +2830,7 @@ function previewSystemPrompt(bot: BotRecord) {
       browser: previewPlan.computer === undefined ? false : previewPlan.browser,
     }, { note: previewPlan.note }) },
     { id: "composio", label: "Connected apps", text: caps?.composioMcp && bot.composio !== false && composio.configured(cfg) ? composioSystemPrompt(bot.connectorTools) : "" },
-    { id: "mcp", label: "MCP servers", text: caps?.customMcp ? customMcpPrompt(Object.keys(engineMcpServers(bot))) : "" },
+    { id: "mcp", label: "MCP servers", text: caps?.customMcp ? customMcpPrompt(configuredMcpServerNames(bot)) : "" },
     { id: "browser", label: "Browser", text: previewPlan.browser ? BUILT_IN_BROWSER_SYSTEM_PROMPT : "" },
     { id: "coordination", label: "Team", text: agentsMounted && coordination ? ` ${coordination}` : "" },
     { id: "credential", label: "Credentials", text: agentsMounted ? CREDENTIAL_PROMPT : "" },
@@ -7994,7 +8021,7 @@ async function startTurn(
       // composio — only to a driver that can mount them. Their tools are
       // never pre-allowed, so every call rides the normal permission flow.
       if (instance.adapter.capabilities.customMcp === true) {
-        const custom = engineMcpServers(bot);
+        const custom = await engineMcpServers(bot);
         if (Object.keys(custom).length) integrations.custom = custom;
       }
       // CLI engines work inside the bot's own workspace directory rather
@@ -9465,7 +9492,7 @@ const tighteningRequests = new TighteningRequestService({
   },
   // The card judges the effective mounts, so the snapshot resolves the same
   // way the engine does: through the config-aware custom-server filter.
-  mountedMcpServers: (bot) => Object.keys(engineMcpServers(bot)),
+  mountedMcpServers: (bot) => configuredMcpServerNames(bot),
   enabledSkills: (botId) => listSkills(botId).filter((skill) => skill.enabled).map((skill) => skill.name),
   disableSkill: (botId, name) => {
     const disabled = setSkillEnabled(botId, name, false);
@@ -10154,7 +10181,7 @@ async function runGroupMemberTurn(
   }
   // user-configured MCP servers: same gating as the 1:1 site above.
   if (instance.adapter.capabilities.customMcp === true) {
-    const custom = engineMcpServers(bot);
+    const custom = await engineMcpServers(bot);
     if (Object.keys(custom).length) integrations.custom = custom;
   }
   // Connected-app discovery is intentionally awaited before a provider owns
@@ -12666,16 +12693,47 @@ function mcpServerBody(body: unknown): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   if (!body || typeof body !== "object") return out;
   const record = body as Record<string, unknown>;
-  for (const key of ["command", "args", "env", "type", "url", "headers", "enabled"]) {
+  for (const key of ["command", "args", "env", "type", "url", "headers", "enabled", "oauthConnectionId"]) {
     if (record[key] !== undefined) out[key] = record[key];
   }
   return out;
 }
 
+/** The custom MCP servers this bot's allow-list permits, before any live
+ * OAuth token is resolved. A display-only preview (the system-prompt
+ * preview, and the tightening card's "what would be mounted" snapshot) only
+ * needs these names — resolving a token for those has no observable effect
+ * and would make otherwise-synchronous call sites async for no reason. */
+function configuredMcpServerNames(bot: BotRecord): string[] {
+  return Object.keys(managedPolicy.filterMcp(customMcpServers(cfg, bot.mcpServers)));
+}
+
 /** Configured MCP servers that may reach this bot's engine. While enrolled,
- * the organisation's allow-list filters them; config.json is never changed. */
-function engineMcpServers(bot: BotRecord) {
-  return managedPolicy.filterMcp(customMcpServers(cfg, bot.mcpServers));
+ * the organisation's allow-list filters them; config.json is never changed.
+ * A server backed by an OAuth connection (oauthConnectionId set) gets its
+ * live Authorization header resolved here, right before mounting — never
+ * stored back to config.json or returned by any read API. A connection that
+ * cannot produce a fresh token (expired refresh, revoked, never connected)
+ * is silently dropped from the mount rather than mounted with a missing or
+ * stale header; server/mcp-oauth.ts marks it "error"/"expired" so the
+ * management API can tell the person to reconnect. */
+async function engineMcpServers(bot: BotRecord): Promise<Record<string, McpServerSpec>> {
+  const filtered = managedPolicy.filterMcp(customMcpServers(cfg, bot.mcpServers));
+  const out: Record<string, McpServerSpec> = {};
+  for (const [name, server] of Object.entries(filtered)) {
+    const oauthConnectionId = (server as CustomMcpServer).oauthConnectionId;
+    if (!oauthConnectionId) {
+      out[name] = server;
+      continue;
+    }
+    const authorization = await mcpOAuthConnections.resolveAuthorizationHeader(oauthConnectionId);
+    if (!authorization) continue;
+    out[name] = {
+      ...server,
+      headers: { ...("headers" in server ? server.headers : undefined), Authorization: authorization },
+    } as McpServerSpec;
+  }
+  return out;
 }
 
 function persistMcpServers(next: Record<string, unknown>): void {
@@ -12874,6 +12932,21 @@ const claudeUpdatesInFlight = new Set<string>();
  * bundle anyone can download, holds no secrets, and a remote browser must be
  * able to load /pair before it has a session. Returns false when there is
  * nothing to serve so the caller can answer 404. */
+/** Renders the MCP OAuth callback's landing page. Plain text only — the
+ * authorization server's own error_description ends up here, so it is
+ * escaped rather than trusted as markup. No script, no redirect: this is
+ * the last hop of the flow, meant to be closed by hand on a phone. */
+function mcpOAuthCallbackPage(result: { ok: true } | { ok: false; error: string }): string {
+  const escape = (value: string) => value.replace(/[&<>"']/g, (char) => (
+    { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[char] as string
+  ));
+  const title = result.ok ? "Connected" : "Connection failed";
+  const body = result.ok
+    ? "This connection is ready. You can close this tab and go back to OpenMausBot."
+    : `This connection could not be completed: ${escape(result.error)}. You can close this tab and try again from OpenMausBot.`;
+  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>${title} — OpenMausBot</title></head><body style="font-family: -apple-system, system-ui, sans-serif; max-width: 32rem; margin: 3rem auto; padding: 0 1rem; color: #1a1a1a;"><h1>${title}</h1><p>${body}</p></body></html>`;
+}
+
 function serveStatic(res: ServerResponse, path: string): boolean {
   if (!STATIC_DIR) return false;
   const safe = path === "/" ? "/index.html" : path.replace(/\.\./g, "");
@@ -12972,6 +13045,10 @@ ROUTES.push(createHostedSlackRoutes({ bot: (id) => store.bot(id), hostedReady: (
 // its file, so New bot cannot disagree with it. No organization: none.
 const orgInstallStatuses = () => orgLibrary?.installStatuses() ?? new Map();
 ROUTES.push(createBotPresetRoutes({ presets: presetStore, orgStatuses: orgInstallStatuses }));
+ROUTES.push(createMcpOAuthRoutes({
+  connections: mcpOAuthConnections,
+  ownerLabel: (auth) => (auth.kind === "session" ? auth.session.label : auth.kind),
+}));
 
 const toolResults = new ToolResults();
 const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
@@ -13164,6 +13241,27 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     // name and icon before anyone has a session, and it holds nothing secret.
     if (method === "GET" && path === "/api/brand" && !gate.auth) {
       return json(res, 200, loadBrand());
+    }
+    // The MCP OAuth callback: reached directly by the authorization server's
+    // browser redirect, which carries no OpenMausBot session (and, on a
+    // phone, may be a different browser entirely from the one used to start
+    // the connection). `state` is the entire security boundary from here —
+    // see server/mcp-oauth.ts's McpOAuthFlowStore. Never redirects anywhere
+    // (a redirect target could leak the code/state in a Referer header);
+    // always ends the request with a minimal static page.
+    const oauthCallback = /^\/oauth\/mcp\/callback\/([A-Za-z0-9_-]{1,64})$/.exec(path);
+    if (method === "GET" && oauthCallback) {
+      const connectionId = oauthCallback[1]!;
+      const query = url.searchParams;
+      const result = await mcpOAuthConnections.complete(connectionId, {
+        code: query.get("code") ?? undefined,
+        state: query.get("state") ?? undefined,
+        error: query.get("error") ?? undefined,
+        errorDescription: query.get("error_description") ?? undefined,
+      });
+      res.writeHead(result.ok ? 200 : 400, { "content-type": "text/html; charset=utf-8" });
+      res.end(mcpOAuthCallbackPage(result));
+      return;
     }
     if (!gate.auth) return json(res, gate.status, { error: gate.error });
     const auth = gate.auth;
