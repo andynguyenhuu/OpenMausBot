@@ -1364,6 +1364,20 @@ const mcpOAuthStore = new McpOAuthStore(mcpOAuthPersistence);
 // launch, whatever OMB_PUBLIC_URL the operator already sets for that path.
 // Computed fresh per call, never cached, since a managed endpoint can be
 // provisioned after this process started.
+//
+// Neither variable requires public-internet reach — only that the phone's
+// *browser* can reach it, which is a lower bar. OMB_PUBLIC_URL in particular
+// already carries a tailnet-only HTTPS origin as one of its ordinary values:
+// `serve --tailscale` (this file's own CLI, see server/cli.ts) sets it to
+// `https://<tailnet-dns-name>` precisely because Tailscale Serve terminates
+// HTTPS there and only tailnet devices — which includes a paired phone — can
+// dial it. So an operator who runs the packaged desktop app without a
+// managed Cloudflare Tunnel, but who already has Tailscale Serve issuing
+// HTTPS on this machine, can point OMB_PUBLIC_URL (set in the environment
+// that launches Electron, e.g. via `launchctl setenv` before the app starts
+// — see electron/main.mjs's `startServerOn`, which spreads `process.env`
+// into the child server's environment) at that same tailnet HTTPS origin and
+// this callback works without any new config key.
 const mcpOAuthConnections = new McpOAuthConnections({
   store: mcpOAuthStore,
   callbackOrigin: () => process.env.OMB_MANAGED_ENDPOINT_URL?.trim().replace(/\/+$/, "") || FALLBACK_PUBLIC_URL,

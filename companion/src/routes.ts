@@ -53,12 +53,32 @@ export const CLOUD_DESKTOP_CONTROL_ROUTE = {
   path: /^\/api\/bots\/[\w-]+\/computer\/(?:control|screenshot|viewer-close)$/,
 } as const;
 
+// The MCP OAuth callback: a remote authorization server's browser redirect
+// lands here directly, exactly as it does on the harness's own unproxied
+// port (see server/index.ts's pre-auth handling of this same path, and
+// server/mcp-oauth.ts's McpOAuthFlowStore). It is not one of this device's
+// own API calls — the phone may not be paired yet, or the redirect may land
+// in an entirely different browser than the one that started the
+// connection — so it cannot carry this device's bearer token. `state` is
+// the whole security boundary from here, same as it is for the harness
+// directly, which is what makes it safe to let through unauthenticated
+// like pairing and health below. Outside `/api/` on purpose: it belongs to
+// the harness's own root, not the fleet API this file otherwise gates.
+export const MCP_OAUTH_CALLBACK_ROUTE = {
+  method: "GET",
+  path: /^\/oauth\/mcp\/callback\/[\w-]{1,64}$/,
+} as const;
+
 export function isCloudDesktopJoin(method: string, path: string): boolean {
   return method === CLOUD_DESKTOP_JOIN_ROUTE.method && CLOUD_DESKTOP_JOIN_ROUTE.path.test(path);
 }
 
 export function isMessageFileDownload(method: string, path: string): boolean {
   return method === MESSAGE_FILE_ROUTE.method && MESSAGE_FILE_ROUTE.path.test(path);
+}
+
+export function isMcpOAuthCallback(method: string, path: string): boolean {
+  return method === MCP_OAUTH_CALLBACK_ROUTE.method && MCP_OAUTH_CALLBACK_ROUTE.path.test(path);
 }
 
 export function isCloudDesktopAccess(method: string, path: string): boolean {
@@ -241,6 +261,11 @@ export function denyReason({ path, method, authenticated }: RouteRequest): Denia
   // exactly the person it was for — which reads as "broken" rather than
   // "unpaired". It discloses nothing a port scan would not.
   if (method === "GET" && path === "/api/health") return null;
+  // And the MCP OAuth callback: a remote authorization server's redirect,
+  // not this device's own request, so it never carries this device's
+  // bearer token either. See MCP_OAUTH_CALLBACK_ROUTE above for why that is
+  // safe.
+  if (isMcpOAuthCallback(method, path)) return null;
 
   if (!authenticated) {
     return { status: 401, error: "pair this device from Remote access settings on the host computer" };

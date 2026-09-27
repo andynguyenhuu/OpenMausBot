@@ -30,6 +30,22 @@ describe("credentials", () => {
     expect(ask("POST", "/api/health", false)?.status).toBe(401);
     expect(ask("GET", "/api/healthz", false)?.status).toBe(401);
   });
+
+  it("lets the MCP OAuth authorization redirect land unauthenticated", () => {
+    // The redirect carries no bearer token — it may arrive in a different
+    // browser than the one that started the connection, or on a device that
+    // was never paired at all. `state` is the security boundary from here,
+    // not this allowlist.
+    expect(ask("GET", "/oauth/mcp/callback/conn_123", false)).toBeNull();
+    expect(ask("GET", "/oauth/mcp/callback/conn_123")).toBeNull();
+    // the bypass is exactly this path shape, not a family
+    expect(ask("POST", "/oauth/mcp/callback/conn_123", false)?.status).toBe(401);
+    expect(ask("GET", "/oauth/mcp/callback/", false)?.status).toBe(401);
+    expect(ask("GET", "/oauth/mcp/callback/conn_123/extra", false)?.status).toBe(401);
+    expect(ask("GET", "/oauth/mcp/other", false)?.status).toBe(401);
+    // 65 characters: one past the harness's own connectionId cap
+    expect(ask("GET", `/oauth/mcp/callback/${"a".repeat(65)}`, false)?.status).toBe(401);
+  });
 });
 
 describe("what the app may do", () => {

@@ -13,6 +13,7 @@ import {
   Trash2,
 } from "lucide-react";
 
+import { openExternalLink } from "@/lib/app-links";
 import { cn } from "@/lib/cn";
 import { claudeUserMcpEnabled } from "@/lib/feature-flags";
 import { t } from "@/lib/i18n";
@@ -425,7 +426,16 @@ export function McpServersPanel() {
           updatedAt: new Date().toISOString(),
         },
       }));
-      window.open(result.authorizationUrl, "_blank", "noopener,noreferrer");
+      // A bare `window.open` here is a `window.open` fired after the
+      // `await` above, which loses the click's user-activation and is
+      // exactly what Chromium's (and, inside the desktop app, Electron's)
+      // popup blocker targets. `openExternalLink` is this codebase's own
+      // answer to that (see src/lib/app-links.ts and its other call
+      // sites): the preload bridge's `shell.openExternal`, an IPC call with
+      // no such timing dependency, when the desktop app supplies one,
+      // falling back to plain `window.open` only where there is no bridge
+      // — a genuine mobile browser tab included.
+      await openExternalLink(result.authorizationUrl);
       setNotice({ key: "mcp.oauth.opened" });
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
